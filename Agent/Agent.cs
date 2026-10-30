@@ -31,6 +31,13 @@ public sealed class Agent
     /// <summary>上下文压缩配置（对应 pi 的 CompactionSettings）。为 null 时禁用压缩。</summary>
     public CompactionSettings? CompactionSettings { get; set; } = new CompactionSettings();
 
+    /// <summary>
+    /// 会话管理器（对应 pi 的 AgentSession ↔ SessionManager 集成）。
+    /// 非 null 时：循环发出的每条消息 append 进会话树；压缩事件转为 compaction 条目；
+    /// 恢复会话用 RestoreTranscript + SessionManager.BuildProjection。
+    /// </summary>
+    public SessionManager? Session { get; set; }
+
     /// <summary>行动前钩子：可拦截工具调用，权限确认挂载点。</summary>
     public Func<BeforeToolCallContext, Task<BeforeToolCallResult?>>? BeforeToolCall { get; set; }
 
@@ -105,6 +112,20 @@ public sealed class Agent
         return result;
     }
 
+    /// <summary>
+    /// 恢复历史会话：用 SessionManager.BuildProjection() 的重放消息替换当前 transcript
+    /// （对应 pi 打开会话后从投影恢复上下文）。
+    /// </summary>
+    public void RestoreTranscript(IEnumerable<AgentMessage> messages)
+    {
+        if (IsStreaming)
+        {
+            throw new InvalidOperationException("Agent 正在处理中，无法恢复会话。");
+        }
+        _messages.Clear();
+        _messages.AddRange(messages);
+    }
+
     private async Task RunWithLifecycleAsync(IReadOnlyList<AgentMessage> prompts, CancellationToken outerCt)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
@@ -112,6 +133,17 @@ public sealed class Agent
         PendingToolCallCount = 0;
         try
         {
+            // 会话同步：把 transcript 中尚未登记的消息 append 进会话树（同实例幂等）。
+            // 压缩摘要消息不作为 message 条目持久化——由 compaction 条目在投影时重建
+            if (Session is not null)
+            {
+                foreach (var message in _messages)
+                {
+                    if (message is CompactionSummaryMessage) continue;
+                    Session.AppendMessage(message);
+                }
+            }
+
             var context = new AgentContext { Messages = _messages, Tools = _tools };
             var config = new AgentLoopConfig
             {
@@ -139,7 +171,7 @@ public sealed class Agent
         }
     }
 
-    /// <summary>状态归约 + 事件分发（对应 pi 的 processEvents）。演示用同步分发保证顺序。</summary>
+    /// <summary>状态归约 + 事件分发（对应 pi 的 processEvents + _handleAgentEvent 持久化挂钩）。演示用同步分发保证顺序。</summary>
     private void Dispatch(AgentEvent e)
     {
         switch (e)
@@ -149,6 +181,23 @@ public sealed class Agent
                 break;
             case ToolExecutionEndEvent:
                 PendingToolCallCount = Math.Max(0, PendingToolCallCount - 1);
+                break;
+
+            // 会话持久化（对应 pi 的 message_end → sessionManager.appendMessage）：
+            // 压缩摘要消息不单独持久化，由 compaction 条目在投影时重建
+            case MessageEndEvent { Message: not CompactionSummaryMessage and var message }:
+                Session?.AppendMessage(message);
+                break;
+
+            // 压缩 → compaction 条目（对应 pi 的 _runAutoCompaction → appendCompaction）
+            case CompactionEndEvent ce when ce.Summary is not null:
+                if (Session is not null)
+                {
+                    var firstKeptId = ce.FirstKeptMessage is not null && Session.TryGetEntryId(ce.FirstKeptMessage, out var id)
+                        ? id
+                        : Session.LeafId;
+                    Session.AppendCompaction(ce.Summary, firstKeptId, ce.TokensBefore, ce.SystemMessages);
+                }
                 break;
         }
         foreach (var listener in _listeners)

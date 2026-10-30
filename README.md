@@ -9,7 +9,7 @@
 感知 -> 推理 -> 行动 -> 观察 ->（循环）-> 结束
 ```
 
-以及 **上下文管理（Compaction）**：上下文逼近窗口上限时自动 LLM 摘要压缩，agent 无限对话不爆窗口。历次需求与设计决策见 [PRD.md](PRD.md)。
+以及 **上下文管理（Compaction）** 与 **会话管理 + 长短期记忆**：上下文逼近窗口上限时自动 LLM 摘要压缩；会话以 append-only JSONL 持久化为树结构，可跨进程恢复、分支；`AGENTS.md` 作为长期记忆注入 system prompt。历次需求与设计决策见 [PRD.md](PRD.md)。
 
 ## 项目结构
 
@@ -22,7 +22,9 @@ ReactDemo/
 │   ├── AgentEvents.cs        # AgentEvent 事件定义（循环与 UI 解耦，含压缩事件）
 │   ├── AgentMessages.cs      # 消息与内容块类型（System/User/Assistant/ToolResult/CompactionSummary）
 │   ├── AgentTool.cs          # 工具抽象：JSON Schema 参数定义、并行/顺序执行、错误即观察
-│   └── Compaction.cs         # 上下文压缩：阈值触发、切点算法、split turn、LLM 摘要、原位替换
+│   ├── Compaction.cs         # 上下文压缩：阈值触发、切点算法、split turn、LLM 摘要、原位替换
+│   ├── SessionManager.cs     # 会话管理：JSONL append-only 会话树、分支、投影重放
+│   └── Memory.cs             # 长期记忆：AGENTS.md 等 context files 发现与 system prompt 注入
 ├── Demo/                     # 演示层
 │   ├── ConsoleEventPrinter.cs# 控制台事件打印（订阅 AgentEvent 渲染，含压缩事件）
 │   ├── DemoTools.cs          # 示例工具 calculate
@@ -46,14 +48,23 @@ ReactDemo/
 - **双模式运行**：
   - 默认：调用本地真实大模型（`.env` 配置，任意 OpenAI 兼容端点）；
   - `mock`：`dotnet run -- mock` 离线脚本化演示（含"错误即观察"与 steering 演示）；
-  - `compact`：`dotnet run -- compact` 离线上下文压缩演示（极小窗口迫使阈值触发）。
+  - `compact`：`dotnet run -- compact` 离线上下文压缩演示（极小窗口迫使阈值触发）；
+  - 附加参数：`--new` 强制新建会话（默认继续最近会话）、`--tree` 运行结束后打印会话条目树。
 - **上下文管理（Compaction）**：对应 pi 的 compaction 机制——
   - 阈值触发：`contextTokens > contextWindow - reserveTokens`，每轮工具结果落库后检查（`prepareNextTurn` 语义）；
   - 切点算法：从尾部累计 token 达 `keepRecentTokens` 确定保留起点，`toolResult` 永不单独丢弃（与 `toolCall` 成对保留），单回合超长自动 split turn（历史与回合前缀分别摘要后合并）；
   - LLM 摘要：结构化 Markdown（Goal/Progress/Key Decisions/Next Steps/...），携带上一次摘要做迭代式增量更新；
-  - 替换语义：摘要转为一条 user 消息（`<summary>` 包装）放回上下文头部，system prompt 永不参与摘要；
+  - 替换语义：摘要转为一条 user 消息（`<summary>` 包装）放回上下文头部，system prompt 永不参与摘要（压缩时快照、恢复时重放）；
   - 事件通知：`CompactionStartEvent / CompactionEndEvent`（reason：Manual/Threshold/Overflow），UI 可渲染压缩过程；
   - 手动压缩：`agent.CompactAsync(customInstructions)`（对应 pi 的 `/compact`）。
+- **会话管理（Session）**：对应 pi 的 SessionManager——
+  - **JSONL append-only 持久化**：`~/.reactdemo/sessions/<编码后的项目路径>/<时间戳>_<会话id>.jsonl`，首行 session header，坏行容错跳过，懒写盘（首次对话才建文件）；
+  - **会话树**：每个条目有 `id/parentId`，leaf 指针标记当前位置；追加 = leaf 下挂子节点；**分支 = 把 leaf 指回历史节点**（`session.Branch(id)`），历史绝不修改删除；
+  - **投影重放**：`BuildProjection()` 从 leaf 回溯到根、压缩感知地重建模型可见消息（对应 pi 的 buildSessionPath / buildContextEntries）；
+  - **无缝集成**：`agent.Session = session` 即接入——每条消息自动 append、压缩自动转 compaction 条目；默认启动即继续最近会话，跨进程对话不丢上下文。
+- **长短期记忆**：
+  - **短期记忆** = 会话内 transcript（配合 Compaction 压缩），与 pi 语义一致；
+  - **长期记忆** = context files（对应 pi 的 AGENTS.md 机制）：在项目目录或 `~/.reactdemo/` 放置 `AGENTS.md`（或 `CLAUDE.md`），每次会话自动发现并注入 system prompt 的 `<project_instructions>` 段；由用户手动维护。
 
 ## 快速开始
 
@@ -113,6 +124,9 @@ dotnet run -- compact
 | `AgentEvent` | 事件流，UI 解耦 | `agent_events` |
 | `Compaction` | 上下文压缩：阈值/切点/摘要/替换 | `compaction`（prepareNextTurn 集成） |
 | `CompactAsync()` | 手动压缩入口 | `/compact` |
+| `SessionManager` | JSONL 会话树 + 分支 + 投影 | `SessionManager` |
+| `agent.Session` | 消息自动持久化挂钩 | `AgentSession._handleAgentEvent` |
+| `MemoryLoader` | 长期记忆（context files 注入） | `resource-loader` / AGENTS.md |
 
 ## License
 

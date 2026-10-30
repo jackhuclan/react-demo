@@ -345,13 +345,17 @@ public static class Compaction
             }
 
             var tokensBefore = prep.TokensBefore;
+            // 压缩边界的 system prompt 快照（对应 pi 的 CompactionEntry.systemMessage）
+            var systemSnapshot = messages.Take(head).OfType<SystemMessage>().ToList();
             // 原位替换：[头部 system 之后, cut) 区间 → 一条摘要消息
             messages.RemoveRange(head, prep.FirstKeptIndex - head);
             messages.Insert(head, new CompactionSummaryMessage(summary, tokensBefore));
             var tokensAfter = EstimateContextTokens(messages);
+            // 替换后保留的第一条消息（用于会话树的 firstKeptEntryId）
+            AgentMessage? firstKept = head + 1 < messages.Count ? messages[head + 1] : null;
 
             var result = new CompactionResult { Summary = summary, TokensBefore = tokensBefore, TokensAfter = tokensAfter, Reason = reason };
-            emit(new CompactionEndEvent(reason, summary, tokensBefore, tokensAfter, ErrorMessage: null));
+            emit(new CompactionEndEvent(reason, summary, tokensBefore, tokensAfter, ErrorMessage: null, firstKept, systemSnapshot));
             return result;
         }
         catch (CompactionException ex)

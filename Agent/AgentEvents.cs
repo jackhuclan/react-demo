@@ -25,4 +25,8 @@ public sealed record CompactionStartEvent(CompactionReason Reason) : AgentEvent;
 
 /// <summary>压缩结束（对应 pi 的 compaction_end / session_compact / session_compact_failed）。Summary 为 null 表示跳过或失败。</summary>
 public sealed record CompactionEndEvent(
-    CompactionReason Reason, string? Summary, int TokensBefore, int TokensAfter, string? ErrorMessage) : AgentEvent;
+    CompactionReason Reason, string? Summary, int TokensBefore, int TokensAfter, string? ErrorMessage,
+    /// <summary>压缩后保留的第一条消息（会话管理据此写入 firstKeptEntryId）。</summary>
+    AgentMessage? FirstKeptMessage = null,
+    /// <summary>压缩边界的 system prompt 快照（会话管理据此写入 compaction 条目）。</summary>
+    IReadOnlyList<SystemMessage>? SystemMessages = null) : AgentEvent;

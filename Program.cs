@@ -5,21 +5,39 @@ using ReactDemo.Demo;
 // ---------------------------------------------------------------------------
 // C# 版 ReAct 演示：感知 -> 推理 -> 行动 -> 观察 循环。
 //   默认模式：调用本地真实大模型（.env 配置，OpenAI 兼容端点）
-//   mock 模式：dotnet run -- mock    离线脚本化演示（含"错误即观察"与 steering）
+//   mock 模式：dotnet run -- mock      离线脚本化演示（含"错误即观察"与 steering）
 //   compact 模式：dotnet run -- compact  离线演示上下文压缩（阈值触发 + LLM 摘要 + 原位替换）
+//   附加参数：--new 强制新建会话（默认继续最近会话）；--tree 运行结束后打印会话条目树
 // ---------------------------------------------------------------------------
 
 Env.Load(Path.Combine(AppContext.BaseDirectory, ".env"));
 
 var useMock = args.Contains("mock", StringComparer.OrdinalIgnoreCase);
 var useCompactDemo = args.Contains("compact", StringComparer.OrdinalIgnoreCase);
+var forceNewSession = args.Contains("--new", StringComparer.OrdinalIgnoreCase);
+var printTree = args.Contains("--tree", StringComparer.OrdinalIgnoreCase);
+
+// ---- 长期记忆（对应 pi 的 context files：AGENTS.md 注入 system prompt）--------
+var memoryFiles = MemoryLoader.LoadContextFiles(Environment.CurrentDirectory);
+if (memoryFiles.Count > 0)
+{
+    Console.WriteLine($"已加载长期记忆: {string.Join(", ", memoryFiles.Select(f => f.Path))}");
+}
+var memorySection = memoryFiles.Count > 0
+    ? "\n\n" + MemoryLoader.RenderProjectContext(memoryFiles)
+    : "";
+
+// ---- 会话管理：默认继续最近会话（无则新建），--new 强制新建 ---------------------
+var session = forceNewSession
+    ? SessionManager.Create()
+    : SessionManager.ContinueRecent();
 
 Agent agent;
 if (useMock || useCompactDemo)
 {
     Console.WriteLine(useCompactDemo ? "=== 模式：离线 compact（上下文压缩演示）===" : "=== 模式：离线 mock（脚本化 LLM）===");
     Console.WriteLine();
-    agent = new Agent("你是运行在终端里的演示助手，擅长使用工具回答问题。")
+    agent = new Agent("你是运行在终端里的演示助手，擅长使用工具回答问题。" + memorySection)
     {
         Stream = MockLlm.Create(),
     };
@@ -42,7 +60,7 @@ else
     var options = OpenAiLlm.FromEnvironment();
     Console.WriteLine($"=== 模式：真实模型 {options.Model} @ {options.BaseUrl} ===");
     Console.WriteLine();
-    agent = new Agent("你是运行在终端里的演示助手。需要计算时请使用 calculate 工具，不要心算。")
+    agent = new Agent("你是运行在终端里的演示助手。需要计算时请使用 calculate 工具，不要心算。" + memorySection)
     {
         Stream = OpenAiLlm.CreateStreamFn(options),
     };
@@ -56,6 +74,19 @@ else
         KeepRecentTokens = int.TryParse(Environment.GetEnvironmentVariable("COMPACTION_KEEP_RECENT_TOKENS"), out var k) ? k : 20000,
     };
 }
+
+// 会话接线：新消息 append 进会话树、压缩事件转 compaction 条目；恢复历史用投影重放
+agent.Session = session;
+if (session.EntryCount > 0)
+{
+    Console.WriteLine($"继续会话 {session.SessionId[..8]}…（已恢复 {session.EntryCount} 条记录，文件 {session.SessionFile}）");
+    agent.RestoreTranscript(session.BuildProjection());
+}
+else
+{
+    Console.WriteLine($"新会话 {session.SessionId[..8]}…（首次对话后写入 {Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)}\\.reactdemo\\sessions\\）");
+}
+Console.WriteLine();
 
 // 事件订阅：循环核心对 UI 一无所知，全部通过 AgentEvent 解耦
 using var _subscription = agent.Subscribe(ConsoleEventPrinter.Print);
@@ -123,4 +154,73 @@ foreach (var message in agent.Messages)
     Console.WriteLine($"  {summary}");
 }
 
+// 会话持久化结果 + 可选的条目树打印
+Console.WriteLine();
+Console.WriteLine($"=== 会话已保存: {session.SessionFile}（共 {session.EntryCount} 条记录）===");
+if (printTree)
+{
+    Console.WriteLine();
+    Console.WriteLine("=== 会话条目树（id type 概要）===");
+    PrintSessionTree(session);
+}
+
 return 0;
+
+/// <summary>按 parentId 缩进打印会话树（演示 SessionManager 的树结构与分支关系）。</summary>
+static void PrintSessionTree(SessionManager session)
+{
+    var roots = new List<SessionEntry>();
+    var children = new Dictionary<string, List<SessionEntry>>();
+    foreach (var entry in session.Entries)
+    {
+        if (entry.ParentId is { } parent)
+        {
+            if (!children.TryGetValue(parent, out var list))
+            {
+                list = [];
+                children[parent] = list;
+            }
+            list.Add(entry);
+        }
+        else
+        {
+            roots.Add(entry);
+        }
+    }
+
+    foreach (var root in roots)
+    {
+        PrintNode(root, 0);
+    }
+    return;
+
+    void PrintNode(SessionEntry entry, int depth)
+    {
+        var indent = new string(' ', depth * 2);
+        var marker = entry.Id == session.LeafId ? " <- leaf" : "";
+        var detail = entry switch
+        {
+            MessageEntry m => m.Message switch
+            {
+                UserMessage u => $"user: {Truncate(u.GetText())}",
+                AssistantMessage a => $"assistant: {Truncate(a.GetText())}",
+                ToolResultMessage t => $"toolResult: {Truncate(t.GetText())}",
+                SystemMessage => "system",
+                _ => "",
+            },
+            CompactionEntry c => $"compaction: {Truncate(c.Summary, 40)} (tokensBefore={c.TokensBefore})",
+            BranchSummaryEntry => "branch_summary",
+            SessionInfoEntry s => $"session_info: {s.Name}",
+            _ => "",
+        };
+        Console.WriteLine($"{indent}{entry.Id}  {marker}");
+        if (detail.Length > 0) Console.WriteLine($"{indent}    {detail}");
+        foreach (var child in children.GetValueOrDefault(entry.Id, []))
+        {
+            PrintNode(child, depth + 1);
+        }
+    }
+
+    static string Truncate(string text, int max = 50) =>
+        text.Length <= max ? text.Replace('\n', ' ') : text[..max].Replace('\n', ' ') + "…";
+}

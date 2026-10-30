@@ -142,3 +142,76 @@ CI 连续失败且只显示 "exit code 1"（匿名无法拉取日志）；需要
 ### 状态
 
 ✅ 已完成
+
+---
+
+## R5：会话管理与长短期记忆（2026-10-30）
+
+### 背景
+
+R4 之后 agent 具备了单次运行内的完整能力，但进程结束上下文即丢失：无法继续上次对话、无法回看/分支历史。pi 有一套成熟的会话管理（session tree + JSONL 持久化）与记忆机制，需要调研后在 C# 侧复刻。
+
+### 调研结论（D:/repo/front/pi，核心在 packages/coding-agent/src/core/session-manager.ts）
+
+**A. 会话管理：append-only JSONL 会话树**
+
+1. **持久化**：`~/.pi/agent/sessions/<编码后的cwd>/<ISO时间戳>_<uuidv7>.jsonl`；每行一个 JSON；首行固定 session header（type/id/timestamp/cwd）；坏行解析时跳过；懒写盘（首条消息才建文件）。
+2. **树结构**：每个 entry 有 `id`（8 位 hex）/`parentId`，leaf 指针标记当前位置；**追加 = leaf 下挂子节点并推进 leaf；分支 = 把 leaf 指回历史节点，历史绝不修改/删除**。
+3. **条目类型**（11 种）：message / compaction / branch_summary / custom / custom_message / context_edit / label / session_info / usage / thinking_level_change / model_change。核心为前三种。
+4. **投影算法四件套**（恢复上下文的关键）：
+   - `buildSessionPath`：从 leaf 沿 parentId 回溯到根；
+   - `buildContextEntries`：压缩感知——`[最新压缩条目] + [firstKeptEntryId 起至压缩点（去 system）] + [压缩点之后全部]`；
+   - `sessionEntryToContextMessages`：条目 → 模型消息（compaction 条目 → `[systemMessage 快照, 摘要消息]`；branch_summary → 包裹标签的 user 消息）；
+   - `buildSessionProjection`：应用 context_edit，仅最新压缩条目产出摘要消息（index>0 置空）。
+5. **API 面**：`create / open / continueRecent / list / appendMessage / appendCompaction / appendBranchSummary / branch / resetLeaf / getBranch / buildSessionProjection` 等。
+
+**B. 记忆机制：pi 没有独立 "memory" 子系统，由三个正交机制构成**
+
+| 机制 | 形态 | 角色 |
+|------|------|------|
+| Context Files | 用户手写 `AGENTS.md`/`CLAUDE.md`（全局 `~/.pi/agent/` + 项目目录逐级向上发现），注入 system prompt 的 `<project_instructions>` 段 | **长期记忆**（纯手动维护，运行时不自动改写） |
+| 会话树 + Compaction | JSONL transcript + LLM 结构化摘要（Goal/Progress/Decisions/Next Steps，带 previousSummary 迭代更新） | **短期记忆**（会话内工作记忆） |
+| Branch Summary | 导航离开分支时 LLM 生成摘要条目 | 分支级记忆 |
+
+**C. 数据流**：启动 → ResourceLoader 发现 context files → SessionManager.create/continueRecent → 用户输入 → 循环执行（每个 message_end 事件 appendMessage 持久化；阈值触发 compaction → appendCompaction 且快照 systemMessage）→ 下次启动 open/continueRecent → buildSessionProjection 重放出与中断前一致的上下文。
+
+### 设计方案（C# 复刻，演示规模裁剪）
+
+- **`Agent/SessionManager.cs`**：SessionHeader + 4 种条目（message/compaction/branch_summary/session_info）+ JSONL 读写（懒写盘、坏行容错）+ 树索引 + `GetBranch / BuildContextEntries / BuildProjection` 三算法 + `Create / Open / ContinueRecent / List` 工厂 + `AppendMessage / AppendCompaction / AppendBranchSummary / AppendSessionInfo / Branch / ResetLeaf`。
+- **`Agent/Memory.cs`**：`MemoryLoader.LoadContextFiles(cwd)`（全局 `~/.reactdemo/AGENTS.md` 优先，项目目录逐级向上，override 文件优先）+ `RenderProjectContext()` 渲染 `<project_instructions>` 段。
+- **集成**（对应 pi 的 AgentSession._handleAgentEvent 挂钩）：
+  - `agent.Session = session` 即接入；`RunWithLifecycleAsync` 运行前把 transcript 中未登记消息补录，Dispatch 中 `MessageEndEvent → AppendMessage`；
+  - `CompactionEndEvent` 新增 `FirstKeptMessage` 与 `SystemMessages`：前者定位 `firstKeptEntryId`，后者是压缩边界的 system prompt 快照（对齐 pi 的 `CompactionEntry.systemMessage`），恢复会话时随摘要一起重放；
+  - `Program` 默认 `ContinueRecent()`（`--new` 强制新建），恢复时 `RestoreTranscript(session.BuildProjection())`；长期记忆在组装 system prompt 时注入。
+- **消息 ↔ JSON 编解码**：手写 DTO 映射（system/user/assistant/toolResult/compactionSummary 五种角色 + toolCall 内容块）。
+
+### 实现中发现并修复的问题
+
+1. **投影条件写反**：初版误写为 `i < Count-1` 跳过压缩条目，导致恢复时摘要丢失——pi 规则是**仅 index 0（最新）压缩条目产出摘要**，已修正为 `i > 0` 跳过。
+2. **压缩摘要消息被重复持久化**：运行前同步时未跳过 `CompactionSummaryMessage`，导致会话树里同时存在 compaction 条目和摘要消息条目——已在同步处按类型排除。
+3. **恢复后 system prompt 丢失**：system 消息位于被摘要区间，投影不含——按 pi 方案在压缩条目中快照 system 消息，投影重放时前插。
+4. **消息→条目映射**：压缩切点需要消息的 entryId——用 `ConditionalWeakTable<AgentMessage, string>` 建立引用映射（record 值相等会误判，必须引用语义），投影重建的消息同样登记。
+
+### 与 pi 的差异（演示规模取舍）
+
+| 项 | pi | 本项目 |
+|----|----|--------|
+| 条目类型 | 11 种 | 4 种（message/compaction/branch_summary/session_info） |
+| 会话 id | uuidv7 | `Guid.CreateVersion7()`（.NET 10 原生 uuidv7） |
+| context_edit / forkFrom / createBranchedSession | 有 | 未实现（留作扩展点） |
+| list 枚举 | 并发流式 + 1MB header 扫描上限 | 全量解析（演示规模） |
+| system prompt sections diff | 命名 section + 增量发送 | 整段注入（未做 diff） |
+| 记忆更新 | 纯用户手动（+ /reload） | 同（无自动提炼） |
+
+### 验收标准
+
+- `dotnet run -- mock` 连续两次：第二次打印"继续会话"并恢复历史，同一 JSONL 文件追加记录。
+- `dotnet run -- compact --new`：压缩条目（含 system 快照）正确写入 JSONL；后续继续会话时投影重放出 `[system, 摘要, 保留消息]`。
+- `dotnet run -- mock --tree`：打印会话条目树（id/类型/概要/leaf 标记）。
+- 项目目录放 `AGENTS.md` 后运行打印"已加载长期记忆"并注入 system prompt。
+- 真实模型模式：新会话 + 继续会话均正常对话（恢复后模型基于历史直接作答）。
+- Release 构建 0 警告 0 错误；CI 绿灯。
+
+### 状态
+
+✅ 已完成
