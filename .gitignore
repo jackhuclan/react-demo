@@ -1,6 +1,7 @@
 bin/
 obj/
 .env
+.vs/
 
 ## 本地 AI 工作目录
 .workbuddy/

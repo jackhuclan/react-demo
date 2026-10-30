@@ -8,9 +8,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
-  <!-- .env 随程序输出，保证任意工作目录下 DotNetEnv 都能读到 -->
+  <!-- .env 随程序输出，保证任意工作目录下 DotNetEnv 都能读到（.env 不在仓库中，需判空避免 CI 构建失败） -->
   <ItemGroup>
-    <None Include=".env" CopyToOutputDirectory="PreserveNewest" />
+    <None Include=".env" CopyToOutputDirectory="PreserveNewest" Condition="Exists('.env')" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="DotNetEnv" Version="3.2.0" />

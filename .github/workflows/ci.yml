@@ -1,24 +1,92 @@
 name: CI
 
+# 提交/PR 的常规校验：构建。本仓库暂无测试工程，测试步骤留作扩展点。
+#
+# 纯文档提交不触发：跑一遍完整编译没有信息量。
+# 注意 paths-ignore 只按「本次提交涉及的文件」判断——文档提交里一旦混进 .cs/.csproj，
+# 整条流水线照常跑，所以不必担心改 README 时顺手改的代码漏检。
+
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.workbuddy/**'
   pull_request:
-    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.workbuddy/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: '1'
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+  NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
 
 jobs:
   build:
+    name: Build
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
 
-      - name: Setup .NET 10
-        uses: actions/setup-dotnet@v4
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '10.0.x'
 
-      - name: Restore dependencies
-        run: dotnet restore
+      - name: Report SDK
+        run: echo "::notice title=SDK version::$(dotnet --version)"
 
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.NUGET_PACKAGES }}
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      # 还原失败时把报错行提升为 annotation，在 run 页面和 API 上都能直接看到原因。
+      - name: Restore
+        run: |
+          set +e
+          dotnet restore ReactDemo.slnx 2>&1 | tee restore.log
+          status="${PIPESTATUS[0]}"
+          if [[ "${status}" -ne 0 ]]; then
+            grep -E "error|NU[0-9]{4}|MSB[0-9]{4}" restore.log | head -8 | while IFS= read -r line; do
+              echo "::error title=restore::${line}"
+            done
+            exit 1
+          fi
+
+      # 构建同理：失败时把 MSB/CS 错误行提升为 annotation，避免只有一句 exit code 1。
       - name: Build
-        run: dotnet build --no-restore --configuration Release
+        run: |
+          set +e
+          dotnet build ReactDemo.slnx -c Release --no-restore -p:ContinuousIntegrationBuild=true 2>&1 | tee build.log
+          status="${PIPESTATUS[0]}"
+          if [[ "${status}" -ne 0 ]]; then
+            grep -E "error [A-Z]+[0-9]+|MSB[0-9]{4}|CS[0-9]{4}" build.log | head -8 | while IFS= read -r line; do
+              echo "::error title=build::${line}"
+            done
+            exit 1
+          fi
+
+      # 本仓库暂无测试工程。后续补 xUnit/NUnit 工程后，在此加：
+      # dotnet test ReactDemo.slnx -c Release --no-build
