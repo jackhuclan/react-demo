@@ -13,8 +13,9 @@
     <None Include=".env" CopyToOutputDirectory="PreserveNewest" Condition="Exists('.env')" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="DotNetEnv" Version="3.2.0" />
-    <PackageReference Include="OpenAI" Version="2.14.0" />
+    <!-- 版本号统一由 Directory.Packages.props 集中管理 -->
+    <PackageReference Include="DotNetEnv" />
+    <PackageReference Include="OpenAI" />
   </ItemGroup>
 
 </Project>

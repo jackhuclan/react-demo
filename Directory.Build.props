@@ -1,0 +1,45 @@
+<Project>
+
+  <!--
+    全解决方案共享的工程元数据（Directory.Build.props 会被目录树下所有 .csproj 自动导入）。
+    发布 / 升级版本时只改这一处：Version 会同时作用到程序集版本与 NuGet 包版本。
+  -->
+  <PropertyGroup>
+
+    <!-- 版本：语义化版本，同时作为 AssemblyVersion / FileVersion / NuGet 包版本 -->
+    <Version>1.0.0</Version>
+    <VersionPrefix Condition="'$(VersionSuffix)' != ''">$(Version)</VersionPrefix>
+
+    <!-- 作者与公司 -->
+    <Authors>jackhuclan</Authors>
+    <Company>jackhuclan</Company>
+
+    <!-- 产品与描述 -->
+    <Product>ReactDemo</Product>
+    <Description>
+      ReactDemo：C# (.NET 10) 版 ReAct 智能体循环演示。
+      参考 pi 的 Agent 设计：推理-行动循环、工具调用（错误即观察）、steering/followUp、
+      上下文压缩（Compaction）、会话树持久化与恢复（SessionManager）、
+      长期记忆（Context Files）与技能管理（Skills）。
+    </Description>
+
+    <!-- 项目地址 -->
+    <PackageProjectUrl>https://github.com/jackhuclan/react-demo</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jackhuclan/react-demo.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+
+    <!-- 版权与许可证 -->
+    <Copyright>Copyright © 2026 jackhuclan</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+
+    <!-- NuGet 打包通用设置 -->
+    <PackageTags>ai;agent;react;llm;tools;compaction;session;skills</PackageTags>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <Deterministic>true</Deterministic>
+
+    <!-- 编译信息注入程序集（FileVersion / InformationalVersion 显示于文件属性） -->
+    <IncludeSourceRevisionInInformationalVersion>true</IncludeSourceRevisionInInformationalVersion>
+
+  </PropertyGroup>
+
+</Project>

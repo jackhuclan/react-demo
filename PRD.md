@@ -215,3 +215,98 @@ R4 之后 agent 具备了单次运行内的完整能力，但进程结束上下�
 ### 状态
 
 ✅ 已完成
+
+---
+
+## R6：技能管理（Skills）+ 版本/包集中管理（2026-10-30）
+
+### 背景
+
+R5 之后 agent 已具备会话与记忆能力，但缺少 pi 的另一个核心扩展机制：**技能（skills）**——把领域知识（操作规范、模板、流程说明）以 `SKILL.md` 文件形式分发给模型按需使用。同时工程上需要补齐版本管理与 NuGet 中心化包管理（参照 wpf-float-agent 项目的实践）。
+
+### 调研结论（D:/repo/front/pi，核心在 packages/coding-agent/src/core/skills.ts + utils/frontmatter.ts）
+
+**总体设计：两级渐进式披露（progressive disclosure），无调度器**
+
+| 通道 | 内容 | 触发 |
+|------|------|------|
+| system prompt `<skills>` 段 | 每个技能的 name + description + location 的 XML 列表（`<available_skills>`） | 启动/reload 时全量注入 |
+| `read` 工具 | 模型读到 SKILL.md 完整正文 | **模型自主决定**（依据 description） |
+| `/skill:name args` 斜杠命令 | 正文剥 frontmatter 后包成 `<skill ...>` 文本块作为 **user 消息** 注入 | 用户显式输入 |
+
+- **没有 skill 工具、没有关键词匹配、没有向量检索**——触发 = 描述写得好 + 模型 agentic 判断 + 自己会读文件。
+- **发现机制**：目录含 `SKILL.md` → 即"技能根"，**停止向下递归**；根级 `*.md` 仅顶层可作单文件技能；跳过 `.*` 与 `node_modules`；pi 另支持 `.gitignore`/`.ignore` 忽略规则与符号链接跟随。
+- **多源优先级**（`resourcePrecedenceRank`）：CLI 显式路径 > project（`.pi/skills`、`.agents/skills` 祖先链，需项目受信任）> user（`~/.pi/agent/skills`、`~/.agents/skills`）> package > builtin；聚合时**同名 first-wins**（先到者胜，后到者产生 `type:"collision"` 诊断），同一物理文件（软链）静默去重。
+- **SKILL.md 格式**：YAML frontmatter（`name` 缺省取父目录名；`description` 必填，缺失/空白 → 整条技能丢弃；`disable-model-invocation: true` → 不进 prompt 仅可显式调用）+ Markdown 正文（相对路径相对技能目录解析）。
+- **校验规则**：name `^[a-z0-9-]+$`、≤64、首尾不得为 `-`、不得含 `--`；description ≤1024——不合规**仅告警不拒绝**；frontmatter 解析（剥 BOM → CRLF/CR 归一 → `---` 边界）。
+- **prompt 注入格式**（`formatSkillsForPrompt`，Agent Skills 规范 XML）：
+
+```
+The following skills provide specialized instructions for specific tasks.
+Use the read tool to load a skill's file when the task matches its description.
+When a skill file references a relative path, resolve it against the skill directory ...
+
+<available_skills>
+  <skill>
+    <name>pdf-tools</name>
+    <description>Extract text and tables from PDF files.</description>
+    <location>D:/.../.pi/skills/pdf-tools/SKILL.md</location>
+  </skill>
+</available_skills>
+```
+
+- **`/skill:` 展开**：`<skill name="..." location="...">\nReferences are relative to <dir>.\n\n<body>\n</skill>\n\n<args>`；未知技能原样透传；正文是 role:user 的普通文本消息（不是 system、无特殊 block）。
+- **正文不缓存**：pi 刻意每次调用重新读盘（简单、无状态）。
+- 可省略的外围：Package 分发、`resources_discover` 扩展事件、TUI 折叠渲染、settings 覆盖语法、`SourceInfo.origin` 维度。
+
+### 设计方案（C# 复刻，单文件 `Agent/Skills.cs`）
+
+- **数据模型**：`Skill`（Name/Description/FilePath/BaseDir/Source/DisableModelInvocation）、`SkillDiagnostic`（warning/collision）、`SkillLoadResult`。
+- **`Skills.Load((dir, source)[])`**：按传入优先级顺序扫描聚合——同名 first-wins + `File.ResolveLinkTarget` 物理路径去重 + collision 诊断（对齐 pi 真实产品语义：**调用方把高优先级目录排前面**，绕开 pi `includeDefaults` 分支 user/project 顺序相反的坑）。
+- **`LoadFromDir`**：SKILL.md 短路、根级 `*.md` 单文件技能、跳过 `.*`/`node_modules`；**`LoadFromFile`**：frontmatter 解析 + 校验（description 必填否则丢弃，name 不合规仅告警；`disable-model-invocation` 严格布尔语义）。
+- **`ParseFrontmatter`**：照抄 pi 朴素算法（BOM 剥离 → 换行归一 → `startsWith("---")` + 第一个 `"\n---"` 边界）；YAML 用极简子集解析器（`key: value`、`key: |` 块标量、`#` 注释）——SKILL.md 实际只用这些。
+- **`FormatForPrompt`**：`<available_skills>` XML（XML 五字符转义；排除 disable-model-invocation；空列表返回空串不产生空 section）。
+- **`ExpandCommand`**：`/skill:name args` → 读文件剥 frontmatter → `<skill>` 文本块；未知技能透传。
+- **`ReadBody`**：每次读盘不缓存（对齐 pi 刻意设计）。
+- **目录约定**：项目 `<cwd>/.pi/skills`（随仓库分发）> 用户 `~/.reactdemo/skills`。
+- **集成**：
+  - system prompt 组装：base + 记忆段（R5）+ 技能摘要段；
+  - 新增 `ReadFileTool`（Demo/DemoTools.cs，限制对齐 pi：2000 行/单行 2000 字符）作为正文按需加载通道，所有模式注册；
+  - `Program`：启动加载技能并打印（含诊断）；`/skill:` 在提交用户输入前展开（对应 pi 的 `_expandSkillCommand` 时机）；`--no-skills` 禁用；
+  - **MockLlm 技能脚本**（`skills` 离线模式）：模拟"看到摘要 → 自主 read_file → 拿到正文 → calculate → 按技能模板作答"全链路，并把流式输出重构为可复用的 `EmitTurn`；
+  - 仓库自带演示技能 `.pi/skills/report-format/SKILL.md`（固定模板汇报计算结果）。
+
+### 工程化：版本与包管理（参照 wpf-float-agent）
+
+- **`Directory.Build.props`**：Version（1.0.0，同时作用于 AssemblyVersion/FileVersion/NuGet 包版本）、Authors/Company、Product/Description、仓库地址、MIT 许可、`IncludeSourceRevisionInInformationalVersion`（源码修订号注入 ProductVersion）。
+- **`Directory.Packages.props`**：`ManagePackageVersionsCentrally=true`、禁用版本 override，`DotNetEnv 3.2.0` / `OpenAI 2.14.0` 统一维护；csproj 中 PackageReference 只写 Include。
+- 构建产物验证：`FileVersion 1.0.0.0`、`ProductVersion 1.0.0+<git-sha>`。
+
+### 实现中修复的问题
+
+1. `ParseFrontmatter` 返回值与局部变量 `frontmatter`（string[]）重名导致类型错乱——改名为 `fields`。
+2. `EmitTurn` 是异步迭代器，消费侧必须 `await foreach`；技能分支漏赋值 `toolCall2 = null` 引发 CS0165。
+
+### 与 pi 的差异（演示规模取舍）
+
+| 项 | pi | 本项目 |
+|----|----|--------|
+| 忽略规则 | `.gitignore`/`.ignore`/`.fdignore` + `prefixIgnorePattern` | 未实现（仅跳 `.*`/node_modules） |
+| 符号链接 | follow + realpath 去重 | realpath 去重保留（`ResolveLinkTarget`），扫描不 follow |
+| YAML | 完整 yaml 包 | 极简子集（key: value / 块标量 / 注释） |
+| 技能来源 | CLI/settings/package/builtin/扩展事件 | project + user 两级 |
+| system prompt diff | section 化 + 增量 patch 消息 | 每次组装完整 prompt（技能集合固定） |
+| 项目信任门控 | projectTrusted 才加载项目技能 | 未实现（本地演示） |
+
+### 验收标准
+
+- `dotnet run -- skills --new`：打印技能发现结果、`<available_skills>` 注入形态、`/skill:` 展开文本，并完整跑通"read_file 读技能 → calculate → 按模板作答"。
+- 真实模型：`--prompt` 触发后模型自主 read_file 加载技能并按模板输出。
+- 同名冲突：用户目录放同名技能 → project 胜出 + collision 诊断。
+- `--no-skills`：禁用加载，system prompt 无技能段。
+- mock / compact 回归正常；Release 构建 0 错误；CI 绿灯。
+- 程序集元数据来自 Directory.Build.props（版本 1.0.0 + git sha）。
+
+### 状态
+
+✅ 已完成

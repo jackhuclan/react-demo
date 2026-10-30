@@ -61,3 +61,54 @@ public sealed class GetTimeTool : AgentTool
         return Task.FromResult(ToolResult.Text(DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss zzz")));
     }
 }
+
+/// <summary>
+/// 演示工具：读取文件文本（对应 pi 的 read 工具）。
+/// 技能系统依赖它实现"正文按需加载"：模型看到 &lt;available_skills&gt; 摘要后，
+/// 自主调用本工具读取 &lt;location&gt; 指向的 SKILL.md 全文。
+/// 限制对齐 pi：最多 2000 行，单行截断到 2000 字符。
+/// </summary>
+public sealed class ReadFileTool : AgentTool
+{
+    private const int MaxLines = 2000;
+    private const int MaxLineLength = 2000;
+
+    public ReadFileTool()
+    {
+        Name = "read_file";
+        Label = "读文件";
+        Description = "读取指定路径的文本文件并返回内容（最多 2000 行，单行超长会截断）。path 参数为绝对路径。";
+        RequiredArguments = ["path"];
+        ParametersSchema = """
+            {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string", "description": "要读取的文件的绝对路径" }
+              },
+              "required": ["path"]
+            }
+            """;
+    }
+
+    public override Task<ToolResult> ExecuteAsync(
+        string toolCallId, JsonObject arguments, CancellationToken ct, Action<ToolResult>? onPartialResult = null)
+    {
+        var path = arguments["path"]?.ToString() ?? "";
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return Task.FromResult(ToolResult.Text($"文件不存在：{path}", isError: true));
+            }
+            var lines = File.ReadAllLines(path);
+            var truncated = lines.Take(MaxLines)
+                .Select(l => l.Length > MaxLineLength ? l[..MaxLineLength] + "…[truncated]" : l);
+            var note = lines.Length > MaxLines ? $"\n…（共 {lines.Length} 行，仅显示前 {MaxLines} 行）" : "";
+            return Task.FromResult(ToolResult.Text(string.Join('\n', truncated) + note));
+        }
+        catch (Exception ex)
+        {
+            return Task.FromResult(ToolResult.Text($"读取失败：{ex.Message}", isError: true));
+        }
+    }
+}

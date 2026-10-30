@@ -7,15 +7,22 @@ using ReactDemo.Demo;
 //   默认模式：调用本地真实大模型（.env 配置，OpenAI 兼容端点）
 //   mock 模式：dotnet run -- mock      离线脚本化演示（含"错误即观察"与 steering）
 //   compact 模式：dotnet run -- compact  离线演示上下文压缩（阈值触发 + LLM 摘要 + 原位替换）
-//   附加参数：--new 强制新建会话（默认继续最近会话）；--tree 运行结束后打印会话条目树
+//   skills 模式：dotnet run -- skills    离线演示技能管理（摘要注入 + read 按需加载 + /skill: 展开）
+//   附加参数：--new 强制新建会话（默认继续最近会话）；--tree 打印会话条目树；
+//             --no-skills 禁用技能加载
 // ---------------------------------------------------------------------------
 
 Env.Load(Path.Combine(AppContext.BaseDirectory, ".env"));
 
 var useMock = args.Contains("mock", StringComparer.OrdinalIgnoreCase);
 var useCompactDemo = args.Contains("compact", StringComparer.OrdinalIgnoreCase);
+var useSkillsDemo = args.Contains("skills", StringComparer.OrdinalIgnoreCase);
+var noSkills = args.Contains("--no-skills", StringComparer.OrdinalIgnoreCase);
 var forceNewSession = args.Contains("--new", StringComparer.OrdinalIgnoreCase);
 var printTree = args.Contains("--tree", StringComparer.OrdinalIgnoreCase);
+// 自定义提示词：--prompt "..."（省略时用内置演示提示词）
+var promptIndex = Array.FindIndex(args, a => a.Equals("--prompt", StringComparison.OrdinalIgnoreCase));
+var customPrompt = promptIndex >= 0 && promptIndex + 1 < args.Length ? args[promptIndex + 1] : null;
 
 // ---- 长期记忆（对应 pi 的 context files：AGENTS.md 注入 system prompt）--------
 var memoryFiles = MemoryLoader.LoadContextFiles(Environment.CurrentDirectory);
@@ -27,32 +34,88 @@ var memorySection = memoryFiles.Count > 0
     ? "\n\n" + MemoryLoader.RenderProjectContext(memoryFiles)
     : "";
 
+// ---- 技能管理（对应 pi 的 skills：两级渐进式披露）----------------------------
+//   发现：项目 .pi/skills（优先，随仓库分发）> 用户 ~/.reactdemo/skills，同名 first-wins
+//   注入：<available_skills> 元数据摘要进 system prompt；正文由模型用 read_file 按需读取
+SkillLoadResult skillLoad;
+if (noSkills)
+{
+    skillLoad = SkillLoadResult.Empty;
+    Console.WriteLine("技能已禁用（--no-skills）");
+}
+else
+{
+    skillLoad = Skills.Load(
+        (Skills.ProjectSkillsDir(Environment.CurrentDirectory), "project"),
+        (Skills.UserSkillsDir, "user"));
+    foreach (var skill in skillLoad.Skills)
+    {
+        Console.WriteLine($"已加载技能: {skill.Name} ({skill.Source}) <- {skill.FilePath}");
+    }
+    foreach (var diagnostic in skillLoad.Diagnostics)
+    {
+        Console.WriteLine($"[skills/{diagnostic.Type}] {diagnostic}");
+    }
+}
+var skillsSection = skillLoad.Skills.Count > 0
+    ? "\n\n" + Skills.FormatForPrompt(skillLoad.Skills)
+    : "";
+
 // ---- 会话管理：默认继续最近会话（无则新建），--new 强制新建 ---------------------
 var session = forceNewSession
     ? SessionManager.Create()
     : SessionManager.ContinueRecent();
 
 Agent agent;
-if (useMock || useCompactDemo)
+if (useMock || useCompactDemo || useSkillsDemo)
 {
-    Console.WriteLine(useCompactDemo ? "=== 模式：离线 compact（上下文压缩演示）===" : "=== 模式：离线 mock（脚本化 LLM）===");
+    Console.WriteLine(useCompactDemo ? "=== 模式：离线 compact（上下文压缩演示）==="
+        : useSkillsDemo ? "=== 模式：离线 skills（技能管理演示）==="
+        : "=== 模式：离线 mock（脚本化 LLM）===");
     Console.WriteLine();
-    agent = new Agent("你是运行在终端里的演示助手，擅长使用工具回答问题。" + memorySection)
+
+    if (useSkillsDemo)
     {
-        Stream = MockLlm.Create(),
-    };
-    agent.AddTool(new CalculateTool());
-    // 演示 steering 队列：循环开始时被注入，模型可见两条用户消息
-    agent.Steer(new UserMessage("追加要求：最后请给出计算结果的平方。"));
-    if (useCompactDemo)
-    {
-        // 极小窗口迫使阈值触发：真实场景按模型窗口配置（默认 128000/16384/20000）
-        agent.CompactionSettings = new CompactionSettings
+        // 技能演示：展示 system prompt 注入形态与 /skill: 显式展开，再跑一条
+        // "模型自主 read_file 读技能正文 → 按技能作答" 的脚本化全链路
+        var skillsPrompt = Skills.FormatForPrompt(skillLoad.Skills);
+        Console.WriteLine("--- system prompt 中的技能摘要段 ---");
+        Console.WriteLine(skillsPrompt.Length > 0 ? skillsPrompt : "（无可用技能）");
+        Console.WriteLine();
+
+        const string command = "/skill:report-format 请按该技能的模板汇报 12*34*2 的结果。";
+        var expanded = Skills.ExpandCommand(skillLoad.Skills, command);
+        Console.WriteLine("--- /skill: 显式调用展开 ---");
+        Console.WriteLine(expanded.Length > 0 && expanded != command ? expanded : command);
+        Console.WriteLine();
+
+        agent = new Agent("你是运行在终端里的演示助手。任务与技能描述匹配时，先用 read_file 工具加载技能文件再执行。" + memorySection + skillsSection)
         {
-            ContextWindow = 64,
-            ReserveTokens = 8,
-            KeepRecentTokens = 24,
+            Stream = MockLlm.Create(),
         };
+        agent.AddTool(new ReadFileTool());
+        agent.AddTool(new CalculateTool());
+    }
+    else
+    {
+        agent = new Agent("你是运行在终端里的演示助手，擅长使用工具回答问题。" + memorySection + skillsSection)
+        {
+            Stream = MockLlm.Create(),
+        };
+        agent.AddTool(new CalculateTool());
+        agent.AddTool(new ReadFileTool());
+        // 演示 steering 队列：循环开始时被注入，模型可见两条用户消息
+        agent.Steer(new UserMessage("追加要求：最后请给出计算结果的平方。"));
+        if (useCompactDemo)
+        {
+            // 极小窗口迫使阈值触发：真实场景按模型窗口配置（默认 128000/16384/20000）
+            agent.CompactionSettings = new CompactionSettings
+            {
+                ContextWindow = 64,
+                ReserveTokens = 8,
+                KeepRecentTokens = 24,
+            };
+        }
     }
 }
 else
@@ -60,11 +123,12 @@ else
     var options = OpenAiLlm.FromEnvironment();
     Console.WriteLine($"=== 模式：真实模型 {options.Model} @ {options.BaseUrl} ===");
     Console.WriteLine();
-    agent = new Agent("你是运行在终端里的演示助手。需要计算时请使用 calculate 工具，不要心算。" + memorySection)
+    agent = new Agent("你是运行在终端里的演示助手。需要计算时请使用 calculate 工具，不要心算；任务与技能描述匹配时，先用 read_file 工具加载技能文件再执行。" + memorySection + skillsSection)
     {
         Stream = OpenAiLlm.CreateStreamFn(options),
     };
     agent.AddTool(new CalculateTool());
+    agent.AddTool(new ReadFileTool());
 
     // 压缩配置：可用环境变量覆盖默认值（不配置则用内置默认）
     agent.CompactionSettings = new CompactionSettings
@@ -104,8 +168,13 @@ agent.BeforeToolCall = ctx =>
 agent.AfterToolCall = ctx => Task.FromResult<AfterToolCallResult?>(
     ctx.Result.IsError ? null : new AfterToolCallResult(ctx.Result.GetText() + "（已由 afterToolCall 钩子确认）"));
 
-var prompt = "请先计算 12*34，再把结果乘以 2，告诉我最终答案。";
-Console.WriteLine($"用户: {prompt}");
+var prompt = useSkillsDemo
+    ? "/skill:report-format 请按该技能的模板汇报 12*34*2 的结果。"
+    : customPrompt ?? "请先计算 12*34，再把结果乘以 2，告诉我最终答案。";
+// /skill:name 显式调用在提交用户输入前展开（对应 pi 的 _expandSkillCommand 时机）；
+// 非技能命令原样透传
+prompt = Skills.ExpandCommand(skillLoad.Skills, prompt);
+Console.WriteLine($"用户: {prompt.Replace('\n', ' ')}");
 Console.WriteLine();
 
 try

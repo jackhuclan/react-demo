@@ -9,7 +9,7 @@
 感知 -> 推理 -> 行动 -> 观察 ->（循环）-> 结束
 ```
 
-以及 **上下文管理（Compaction）** 与 **会话管理 + 长短期记忆**：上下文逼近窗口上限时自动 LLM 摘要压缩；会话以 append-only JSONL 持久化为树结构，可跨进程恢复、分支；`AGENTS.md` 作为长期记忆注入 system prompt。历次需求与设计决策见 [PRD.md](PRD.md)。
+以及 **上下文管理（Compaction）**、**会话管理 + 长短期记忆** 与 **技能管理（Skills）**：上下文逼近窗口上限时自动 LLM 摘要压缩；会话以 append-only JSONL 持久化为树结构，可跨进程恢复、分支；`AGENTS.md` 作为长期记忆注入 system prompt；`SKILL.md` 技能按 Anthropic Agent Skills 规范加载，摘要注入 + 正文按需读取。历次需求与设计决策见 [PRD.md](PRD.md)。
 
 ## 项目结构
 
@@ -24,12 +24,16 @@ ReactDemo/
 │   ├── AgentTool.cs          # 工具抽象：JSON Schema 参数定义、并行/顺序执行、错误即观察
 │   ├── Compaction.cs         # 上下文压缩：阈值触发、切点算法、split turn、LLM 摘要、原位替换
 │   ├── SessionManager.cs     # 会话管理：JSONL append-only 会话树、分支、投影重放
-│   └── Memory.cs             # 长期记忆：AGENTS.md 等 context files 发现与 system prompt 注入
+│   ├── Memory.cs             # 长期记忆：AGENTS.md 等 context files 发现与 system prompt 注入
+│   └── Skills.cs             # 技能管理：SKILL.md 发现/解析/校验、<available_skills> 注入、/skill: 展开
 ├── Demo/                     # 演示层
 │   ├── ConsoleEventPrinter.cs# 控制台事件打印（订阅 AgentEvent 渲染，含压缩事件）
-│   ├── DemoTools.cs          # 示例工具 calculate
-│   ├── MockLlm.cs            # 离线脚本化 LLM（mock / compact 模式，可应答摘要请求）
+│   ├── DemoTools.cs          # 示例工具 calculate / read_file（技能正文按需加载通道）
+│   ├── MockLlm.cs            # 离线脚本化 LLM（mock / compact / skills 模式）
 │   └── OpenAiLlm.cs          # OpenAI 兼容端点的流式 LLM 接入
+├── .pi/skills/               # 项目技能（report-format 演示技能，随仓库分发）
+├── Directory.Build.props     # 版本与工程元数据集中管理（Version 只改这一处）
+├── Directory.Packages.props  # NuGet 中心化包管理（CPM，包版本统一维护）
 ├── Program.cs                # 入口：组装 Agent、注册钩子、运行演示
 ├── PRD.md                    # 历次需求记录（PRD 片段）
 └── ReactDemo.slnx            # 解决方案
@@ -49,7 +53,8 @@ ReactDemo/
   - 默认：调用本地真实大模型（`.env` 配置，任意 OpenAI 兼容端点）；
   - `mock`：`dotnet run -- mock` 离线脚本化演示（含"错误即观察"与 steering 演示）；
   - `compact`：`dotnet run -- compact` 离线上下文压缩演示（极小窗口迫使阈值触发）；
-  - 附加参数：`--new` 强制新建会话（默认继续最近会话）、`--tree` 运行结束后打印会话条目树。
+  - `skills`：`dotnet run -- skills` 离线技能演示（摘要注入 + read_file 按需加载 + `/skill:` 展开）；
+  - 附加参数：`--new` 强制新建会话、`--tree` 打印会话条目树、`--no-skills` 禁用技能、`--prompt "..."` 自定义提示词。
 - **上下文管理（Compaction）**：对应 pi 的 compaction 机制——
   - 阈值触发：`contextTokens > contextWindow - reserveTokens`，每轮工具结果落库后检查（`prepareNextTurn` 语义）；
   - 切点算法：从尾部累计 token 达 `keepRecentTokens` 确定保留起点，`toolResult` 永不单独丢弃（与 `toolCall` 成对保留），单回合超长自动 split turn（历史与回合前缀分别摘要后合并）；
@@ -65,6 +70,16 @@ ReactDemo/
 - **长短期记忆**：
   - **短期记忆** = 会话内 transcript（配合 Compaction 压缩），与 pi 语义一致；
   - **长期记忆** = context files（对应 pi 的 AGENTS.md 机制）：在项目目录或 `~/.reactdemo/` 放置 `AGENTS.md`（或 `CLAUDE.md`），每次会话自动发现并注入 system prompt 的 `<project_instructions>` 段；由用户手动维护。
+- **技能管理（Skills）**：对应 pi 的 skills 模块，完全对齐 Anthropic Agent Skills 规范（agentskills.io）的**两级渐进式披露**——没有 skill 工具、没有关键词匹配，触发由 LLM 自主决定：
+  - **发现与解析**：`SKILL.md`（YAML frontmatter `name`/`description`/`disable-model-invocation` + Markdown 正文）；目录含 `SKILL.md` 即"技能根"停止递归；根级 `*.md` 也可作单文件技能；跳过 `.*` 与 `node_modules`；description 必填（缺失丢弃）、name 不合规仅告警；
+  - **多源优先级**：项目 `.pi/skills/`（随仓库分发）> 用户 `~/.reactdemo/skills/`，同名 **first-wins**（后到者产生 collision 诊断）；
+  - **摘要注入**：`<available_skills><skill><name/description/location>` XML 段进 system prompt（这是模型"看见"技能的唯一途径）；
+  - **正文按需加载**：模型依据 description 自主调用 `read_file` 读取 `<location>` 文件（对齐 pi 的 read 工具：最多 2000 行、单行截断 2000 字符）；
+  - **显式调用**：`/skill:name args` → 读文件剥 frontmatter → `<skill ...>` 文本块 + args 作为 user 消息注入（确定性逃生口）；
+  - 自带演示技能 `.pi/skills/report-format`：要求模型按固定模板汇报计算结果。
+- **工程化（版本与包管理）**：
+  - `Directory.Build.props`：版本/作者/仓库等元数据集中管理，升级版本只改一处（自动作用于 AssemblyVersion / FileVersion / NuGet 包版本，并注入源码修订号）；
+  - `Directory.Packages.props`：NuGet 中心化包管理（CPM），所有包版本统一维护，csproj 中 `PackageReference` 只写 `Include` 不写 `Version`。
 
 ## 快速开始
 
@@ -103,11 +118,17 @@ COMPACTION_KEEP_RECENT_TOKENS=20000
 # 真实模型模式
 dotnet run
 
+# 自定义提示词
+dotnet run -- --prompt "请按 report-format 技能的模板汇报 12*34*2 的结果"
+
 # 离线 mock 模式（无需 API Key）
 dotnet run -- mock
 
 # 离线上下文压缩演示（无需 API Key，观察 compaction_start / compaction_end 事件）
 dotnet run -- compact
+
+# 离线技能管理演示（无需 API Key）
+dotnet run -- skills
 ```
 
 运行后会执行示例任务："先计算 12×34，再把结果乘以 2"，可以在控制台看到完整的推理-工具调用-观察过程，以及最终的 transcript 摘要。
@@ -127,6 +148,10 @@ dotnet run -- compact
 | `SessionManager` | JSONL 会话树 + 分支 + 投影 | `SessionManager` |
 | `agent.Session` | 消息自动持久化挂钩 | `AgentSession._handleAgentEvent` |
 | `MemoryLoader` | 长期记忆（context files 注入） | `resource-loader` / AGENTS.md |
+| `Skills` / `SkillLoader` | SKILL.md 发现/校验/聚合（first-wins） | `skills.ts` / `loadSkills` |
+| `FormatForPrompt()` | `<available_skills>` XML 摘要注入 | `formatSkillsForPrompt` |
+| `ExpandCommand()` | `/skill:name args` 展开为 user 消息 | `_expandSkillCommand` |
+| `Directory.Build.props` / `Directory.Packages.props` | 版本与包集中管理 | —（工程实践） |
 
 ## License
 
