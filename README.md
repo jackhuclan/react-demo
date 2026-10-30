@@ -1,5 +1,8 @@
 # ReactDemo — C# 版 ReAct Agent 演示
 
+![CI](https://github.com/jackhuclan/react-demo/actions/workflows/ci.yml/badge.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+
 一个用 C# (.NET 10) 实现的 **ReAct（Reasoning + Acting）智能体循环**演示项目，参考 [pi-mono](https://github.com/badlogic/pi-mono) 的 Agent 设计，完整演示了：
 
 ```
@@ -47,13 +50,23 @@ ReactDemo/
 
 ### 配置
 
-在项目根目录创建 `.env`（OpenAI 兼容格式）：
+复制示例配置并填入实际值：
+
+```bash
+cp .env.example .env
+```
+
+`.env`（OpenAI 兼容格式）：
 
 ```env
-OPENAI_API_KEY=sk-xxx
-OPENAI_BASE_URL=https://api.openai.com/v1   # 或任意兼容端点
-OPENAI_MODEL=gpt-4o                          # 或其他模型名
+OPENAI_BASE_URL=http://localhost:8000/v1   # 任意 OpenAI 兼容端点
+OPENAI_API_KEY=sk-your-api-key
+OPENAI_MODEL=Qwen2.5-7B-Instruct
+OPENAI_MAX_TOKENS=12800
+OPENAI_TEMPERATURE=0.6
 ```
+
+> ⚠️ `.env` 含真实密钥，已在 `.gitignore` 中排除，请勿提交到仓库。
 
 ### 运行
 
