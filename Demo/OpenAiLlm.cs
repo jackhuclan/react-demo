@@ -225,6 +225,10 @@ public static class OpenAiLlm
                 case UserMessage user:
                     result.Add(new UserChatMessage(user.GetText()));
                     break;
+                case CompactionSummaryMessage compacted:
+                    // 压缩摘要按 pi 的约定转为一条 user 消息（summary 标签包装）
+                    result.Add(new UserChatMessage(Compaction.SummaryPrefix + compacted.Summary + Compaction.SummarySuffix));
+                    break;
                 case AssistantMessage assistant:
                 {
                     var chatAssistant = new AssistantChatMessage(assistant.GetText());

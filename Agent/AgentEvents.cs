@@ -19,3 +19,10 @@ public sealed record MessageEndEvent(AgentMessage Message) : AgentEvent;
 public sealed record ToolExecutionStartEvent(string ToolCallId, string ToolName, JsonObject Arguments) : AgentEvent;
 public sealed record ToolExecutionUpdateEvent(string ToolCallId, string ToolName, ToolResult PartialResult) : AgentEvent;
 public sealed record ToolExecutionEndEvent(string ToolCallId, string ToolName, ToolResult Result, bool IsError) : AgentEvent;
+
+/// <summary>压缩开始（对应 pi 的 compaction_start / session_before_compact）。</summary>
+public sealed record CompactionStartEvent(CompactionReason Reason) : AgentEvent;
+
+/// <summary>压缩结束（对应 pi 的 compaction_end / session_compact / session_compact_failed）。Summary 为 null 表示跳过或失败。</summary>
+public sealed record CompactionEndEvent(
+    CompactionReason Reason, string? Summary, int TokensBefore, int TokensAfter, string? ErrorMessage) : AgentEvent;

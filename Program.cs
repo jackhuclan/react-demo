@@ -5,17 +5,19 @@ using ReactDemo.Demo;
 // ---------------------------------------------------------------------------
 // C# 版 ReAct 演示：感知 -> 推理 -> 行动 -> 观察 循环。
 //   默认模式：调用本地真实大模型（.env 配置，OpenAI 兼容端点）
-//   mock 模式：dotnet run -- mock  离线脚本化演示（含"错误即观察"与 steering）
+//   mock 模式：dotnet run -- mock    离线脚本化演示（含"错误即观察"与 steering）
+//   compact 模式：dotnet run -- compact  离线演示上下文压缩（阈值触发 + LLM 摘要 + 原位替换）
 // ---------------------------------------------------------------------------
 
 Env.Load(Path.Combine(AppContext.BaseDirectory, ".env"));
 
 var useMock = args.Contains("mock", StringComparer.OrdinalIgnoreCase);
+var useCompactDemo = args.Contains("compact", StringComparer.OrdinalIgnoreCase);
 
 Agent agent;
-if (useMock)
+if (useMock || useCompactDemo)
 {
-    Console.WriteLine("=== 模式：离线 mock（脚本化 LLM）===");
+    Console.WriteLine(useCompactDemo ? "=== 模式：离线 compact（上下文压缩演示）===" : "=== 模式：离线 mock（脚本化 LLM）===");
     Console.WriteLine();
     agent = new Agent("你是运行在终端里的演示助手，擅长使用工具回答问题。")
     {
@@ -24,6 +26,16 @@ if (useMock)
     agent.AddTool(new CalculateTool());
     // 演示 steering 队列：循环开始时被注入，模型可见两条用户消息
     agent.Steer(new UserMessage("追加要求：最后请给出计算结果的平方。"));
+    if (useCompactDemo)
+    {
+        // 极小窗口迫使阈值触发：真实场景按模型窗口配置（默认 128000/16384/20000）
+        agent.CompactionSettings = new CompactionSettings
+        {
+            ContextWindow = 64,
+            ReserveTokens = 8,
+            KeepRecentTokens = 24,
+        };
+    }
 }
 else
 {
@@ -35,6 +47,14 @@ else
         Stream = OpenAiLlm.CreateStreamFn(options),
     };
     agent.AddTool(new CalculateTool());
+
+    // 压缩配置：可用环境变量覆盖默认值（不配置则用内置默认）
+    agent.CompactionSettings = new CompactionSettings
+    {
+        ContextWindow = int.TryParse(Environment.GetEnvironmentVariable("COMPACTION_CONTEXT_WINDOW"), out var w) ? w : 128000,
+        ReserveTokens = int.TryParse(Environment.GetEnvironmentVariable("COMPACTION_RESERVE_TOKENS"), out var r) ? r : 16384,
+        KeepRecentTokens = int.TryParse(Environment.GetEnvironmentVariable("COMPACTION_KEEP_RECENT_TOKENS"), out var k) ? k : 20000,
+    };
 }
 
 // 事件订阅：循环核心对 UI 一无所知，全部通过 AgentEvent 解耦
@@ -60,6 +80,16 @@ Console.WriteLine();
 try
 {
     await agent.PromptAsync(prompt);
+
+    // compact 演示：第二轮对话把上下文推过阈值，触发压缩（事件流里可见 compaction_start/end）
+    if (useCompactDemo)
+    {
+        var prompt2 = "很好。请再计算 100+23，告诉我答案。";
+        Console.WriteLine();
+        Console.WriteLine($"用户: {prompt2}");
+        Console.WriteLine();
+        await agent.PromptAsync(prompt2);
+    }
 }
 catch (OperationCanceledException)
 {
@@ -87,6 +117,7 @@ foreach (var message in agent.Messages)
             + string.Join("", a.Content.OfType<ToolCallContent>()
                 .Select(c => $" | toolCall {c.Name}({c.Arguments.ToJsonString()})")),
         ToolResultMessage t => $"toolResult {t.ToolName}{(t.IsError ? " [isError]" : "")}: {t.GetText()}",
+        CompactionSummaryMessage c => $"compactionSummary (tokensBefore={c.TokensBefore}):\n{Compaction.SummaryPrefix}{c.Summary}{Compaction.SummarySuffix}",
         _ => message.GetType().Name,
     };
     Console.WriteLine($"  {summary}");

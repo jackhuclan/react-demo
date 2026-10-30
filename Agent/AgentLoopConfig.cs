@@ -68,4 +68,11 @@ public sealed class AgentLoopConfig
     public Func<BeforeToolCallContext, Task<BeforeToolCallResult?>>? BeforeToolCall { get; init; }
     public Func<AfterToolCallContext, Task<AfterToolCallResult?>>? AfterToolCall { get; init; }
     public Func<TurnContext, Task<TurnDecision>>? FinishTurn { get; init; }
+
+    /// <summary>
+    /// 上下文压缩配置（对应 pi 的 CompactionSettings，由 prepareNextTurn 集成）。
+    /// 为 null 或 Enabled=false 时不做压缩检查。每轮工具结果落库后检查阈值，
+    /// 超过 contextWindow - reserveTokens 即触发压缩。
+    /// </summary>
+    public CompactionSettings? Compaction { get; init; }
 }

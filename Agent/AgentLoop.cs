@@ -16,7 +16,8 @@ public static class AgentLoop
         Action<AgentEvent> emit,
         CancellationToken ct)
     {
-        // transcript 是工作副本；Agent 类在循环结束后把 newMessages 合并回真实状态
+        // transcript 是工作副本；压缩可能原位替换历史区间，
+        // 循环结束后由 Agent 用返回的最终 transcript 整体覆盖真实状态
         var messages = new List<AgentMessage>(context.Messages);
         var newMessages = new List<AgentMessage>();
 
@@ -32,7 +33,7 @@ public static class AgentLoop
         }
 
         await RunLoopAsync(messages, context, newMessages, config, emit, ct);
-        return newMessages;
+        return messages;
     }
 
     private static async Task RunLoopAsync(
@@ -46,6 +47,8 @@ public static class AgentLoop
         // 循环开始先捞 steering：用户可能在等待期间已经插话
         var pendingMessages = await (config.GetSteeringMessages?.Invoke() ?? Task.FromResult<IReadOnlyList<AgentMessage>>([]));
         var explicitContinuation = false;
+        // 上次压缩时的消息数：防止压缩后上下文仍超阈值时死循环压缩
+        var lastCompactionCount = 0;
 
         // 外层循环：agent 本来要停时检查 followUp 队列
         while (true)
@@ -71,6 +74,9 @@ public static class AgentLoop
                 // 感知②：流式拿模型决策（推理阶段）
                 var assistant = await StreamAssistantResponseAsync(messages, context, config, emit, ct);
                 newMessages.Add(assistant);
+                // assistant 响应必须进入 transcript：既作为下一轮 LLM 上下文（toolCall 与 toolResult 成对），
+                // 也参与上下文 token 估算与压缩切点判定
+                messages.Add(assistant);
 
                 if (assistant.StopReason is StopReason.Error or StopReason.Aborted)
                 {
@@ -97,6 +103,18 @@ public static class AgentLoop
                 }
 
                 emit(new TurnEndEvent(assistant, toolResults));
+
+                // 上下文压缩检查（对应 pi 在 prepareNextTurn 中嵌入的 compaction）：
+                // 工具结果落库后、下一条 assistant 响应前检查阈值；上次压缩后无新消息则跳过，防死循环
+                if (config.Compaction is { Enabled: true } && messages.Count != lastCompactionCount)
+                {
+                    if (Compaction.ShouldCompact(Compaction.EstimateContextTokens(messages), config.Compaction))
+                    {
+                        lastCompactionCount = messages.Count;
+                        await Compaction.RunAsync(
+                            messages, config.Compaction, config.Stream, emit, CompactionReason.Threshold, ct: ct);
+                    }
+                }
 
                 var decision = config.FinishTurn is null
                     ? TurnDecision.None

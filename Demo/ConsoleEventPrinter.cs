@@ -45,6 +45,22 @@ public static class ConsoleEventPrinter
                 Color(toolEnd.IsError ? ConsoleColor.Red : ConsoleColor.Green, $"=> {toolEnd.Result.GetText()}");
                 break;
 
+            case CompactionStartEvent c:
+                Color(ConsoleColor.DarkCyan, $"── compaction_start ({c.Reason}) ──");
+                break;
+
+            case CompactionEndEvent cEnd:
+                if (cEnd.Summary is null)
+                {
+                    Color(ConsoleColor.DarkYellow, $"── compaction_end ({cEnd.Reason}): {cEnd.ErrorMessage ?? "skipped"} ──");
+                }
+                else
+                {
+                    Color(ConsoleColor.DarkCyan,
+                        $"── compaction_end ({cEnd.Reason}): tokens {cEnd.TokensBefore} -> {cEnd.TokensAfter} ──");
+                }
+                break;
+
             case AgentEndEvent:
                 Color(ConsoleColor.Cyan, "── agent_end ──");
                 break;

@@ -28,6 +28,9 @@ public sealed class Agent
     public required StreamFn Stream { get; init; }
     public ToolExecutionMode ToolExecution { get; set; } = ToolExecutionMode.Parallel;
 
+    /// <summary>上下文压缩配置（对应 pi 的 CompactionSettings）。为 null 时禁用压缩。</summary>
+    public CompactionSettings? CompactionSettings { get; set; } = new CompactionSettings();
+
     /// <summary>行动前钩子：可拦截工具调用，权限确认挂载点。</summary>
     public Func<BeforeToolCallContext, Task<BeforeToolCallResult?>>? BeforeToolCall { get; set; }
 
@@ -82,6 +85,26 @@ public sealed class Agent
         await RunWithLifecycleAsync([], ct);
     }
 
+    /// <summary>
+    /// 手动触发上下文压缩（对应 pi 的 /compact，reason=manual）。
+    /// 可带自定义摘要侧重点（customInstructions）。跳过或失败时返回 null（详见 CompactionEndEvent）。
+    /// </summary>
+    public async Task<CompactionResult?> CompactAsync(
+        string? customInstructions = null, CancellationToken ct = default)
+    {
+        if (IsStreaming)
+        {
+            throw new InvalidOperationException("Agent 正在处理中，无法手动压缩。");
+        }
+        if (CompactionSettings is not { Enabled: true })
+        {
+            return null;
+        }
+        var result = await Compaction.RunAsync(
+            _messages, CompactionSettings, Stream, Dispatch, CompactionReason.Manual, customInstructions, ct);
+        return result;
+    }
+
     private async Task RunWithLifecycleAsync(IReadOnlyList<AgentMessage> prompts, CancellationToken outerCt)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(outerCt);
@@ -97,13 +120,15 @@ public sealed class Agent
                 BeforeToolCall = BeforeToolCall,
                 AfterToolCall = AfterToolCall,
                 FinishTurn = FinishTurn,
+                Compaction = CompactionSettings is { Enabled: true } ? CompactionSettings : null,
                 GetSteeringMessages = () => Task.FromResult<IReadOnlyList<AgentMessage>>(_steeringQueue.Drain()),
                 GetFollowUpMessages = () => Task.FromResult<IReadOnlyList<AgentMessage>>(_followUpQueue.Drain()),
             };
 
-            var newMessages = await AgentLoop.RunAsync(prompts, context, config, Dispatch, _cts.Token);
-            // 循环在工作副本上运行，结束后把本轮新消息合并回真实 transcript
-            _messages.AddRange(newMessages);
+            var finalTranscript = await AgentLoop.RunAsync(prompts, context, config, Dispatch, _cts.Token);
+            // 压缩可能原位替换过历史区间，用最终 transcript 整体覆盖真实状态
+            _messages.Clear();
+            _messages.AddRange(finalTranscript);
         }
         finally
         {

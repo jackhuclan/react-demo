@@ -69,3 +69,24 @@ public sealed record ToolResultMessage : AgentMessage
 
     public string GetText() => string.Concat(Content.OfType<TextContent>().Select(t => t.Text));
 }
+
+/// <summary>
+/// 上下文压缩摘要消息（对应 pi 的 compactionSummary）。
+/// 发给 LLM 时转为一条 user 消息（SummaryPrefix/Suffix 包装），见 Compaction.SummaryPrefix。
+/// </summary>
+public sealed record CompactionSummaryMessage : AgentMessage
+{
+    /// <summary>结构化摘要文本。</summary>
+    public required string Summary { get; init; }
+    /// <summary>压缩前的上下文 token 估算。</summary>
+    public int TokensBefore { get; init; }
+
+    public CompactionSummaryMessage() : base(DateTimeOffset.Now) { }
+
+    [System.Diagnostics.CodeAnalysis.SetsRequiredMembers]
+    public CompactionSummaryMessage(string summary, int tokensBefore) : base(DateTimeOffset.Now)
+    {
+        Summary = summary;
+        TokensBefore = tokensBefore;
+    }
+}
