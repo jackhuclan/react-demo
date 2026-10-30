@@ -9,7 +9,7 @@
 感知 -> 推理 -> 行动 -> 观察 ->（循环）-> 结束
 ```
 
-以及 **上下文管理（Compaction）**、**会话管理 + 长短期记忆** 与 **技能管理（Skills）**：上下文逼近窗口上限时自动 LLM 摘要压缩；会话以 append-only JSONL 持久化为树结构，可跨进程恢复、分支；`AGENTS.md` 作为长期记忆注入 system prompt；`SKILL.md` 技能按 Anthropic Agent Skills 规范加载，摘要注入 + 正文按需读取。历次需求与设计决策见 [PRD.md](PRD.md)。
+以及 **上下文管理（Compaction）**、**会话管理 + 长短期记忆**、**技能管理（Skills）** 与 **交互式 TUI**：上下文逼近窗口上限时自动 LLM 摘要压缩；会话以 append-only JSONL 持久化为树结构，可跨进程恢复、分支；`AGENTS.md` 作为长期记忆注入 system prompt；`SKILL.md` 技能按 Anthropic Agent Skills 规范加载；入口用 System.CommandLine 路由，默认进入 Spectre.Console 交互式终端。历次需求与设计决策见 [PRD.md](PRD.md)。
 
 ## 项目结构
 
@@ -27,14 +27,17 @@ ReactDemo/
 │   ├── Memory.cs             # 长期记忆：AGENTS.md 等 context files 发现与 system prompt 注入
 │   └── Skills.cs             # 技能管理：SKILL.md 发现/解析/校验、<available_skills> 注入、/skill: 展开
 ├── Demo/                     # 演示层
-│   ├── ConsoleEventPrinter.cs# 控制台事件打印（订阅 AgentEvent 渲染，含压缩事件）
+│   ├── ConsoleEventPrinter.cs# headless 模式的事件打印（订阅 AgentEvent 渲染）
+│   ├── Bootstrap.cs          # 共享启动装配：记忆/技能加载、system prompt 组装、会话/Agent 创建
+│   ├── TuiApp.cs             # 交互式 TUI（Spectre.Console）：REPL、slash 命令、流式渲染
+│   ├── HeadlessDemo.cs       # headless 一次性演示（mock / compact / skills 分支）
 │   ├── DemoTools.cs          # 示例工具 calculate / read_file（技能正文按需加载通道）
 │   ├── MockLlm.cs            # 离线脚本化 LLM（mock / compact / skills 模式）
 │   └── OpenAiLlm.cs          # OpenAI 兼容端点的流式 LLM 接入
 ├── .pi/skills/               # 项目技能（report-format 演示技能，随仓库分发）
 ├── Directory.Build.props     # 版本与工程元数据集中管理（Version 只改这一处）
 ├── Directory.Packages.props  # NuGet 中心化包管理（CPM，包版本统一维护）
-├── Program.cs                # 入口：组装 Agent、注册钩子、运行演示
+├── Program.cs                # 入口：System.CommandLine 命令路由（默认 TUI，mock/compact/skills 子命令）
 ├── PRD.md                    # 历次需求记录（PRD 片段）
 └── ReactDemo.slnx            # 解决方案
 ```
@@ -77,6 +80,13 @@ ReactDemo/
   - **正文按需加载**：模型依据 description 自主调用 `read_file` 读取 `<location>` 文件（对齐 pi 的 read 工具：最多 2000 行、单行截断 2000 字符）；
   - **显式调用**：`/skill:name args` → 读文件剥 frontmatter → `<skill ...>` 文本块 + args 作为 user 消息注入（确定性逃生口）；
   - 自带演示技能 `.pi/skills/report-format`：要求模型按固定模板汇报计算结果。
+- **交互式 TUI**：对应 pi 的 interactive-mode，Spectre.Console 复刻核心语义——
+  - **REPL 循环**：`›` 提示符提交输入，Enter 提交、Ctrl+C/Ctrl+D 退出；
+  - **slash 命令**：`/help /new /resume /session /tree /skills /compact [说明] /skill:NAME 参数 /exit`，分发时机与 pi 一致（提交处）；
+  - **事件 → UI 映射**：assistant 流式增量渲染、工具调用带参数与结果状态色（成功绿/失败红）、压缩事件黄色通知；
+  - **资源总览横幅**：模式、会话、技能、长期记忆一目了然；
+  - **全模式集成**：TUI 内对话同样走会话持久化、压缩、技能与长期记忆链路。
+- **CLI 命令路由（System.CommandLine）**：入口按命令分流（对应 pi main.ts 的参数解析）——默认进入 TUI；`mock / compact / skills` 子命令运行 headless 一次性演示；支持 `--help`（自动生成）与 `--version`（版本来自 Directory.Build.props + git sha）。
 - **工程化（版本与包管理）**：
   - `Directory.Build.props`：版本/作者/仓库等元数据集中管理，升级版本只改一处（自动作用于 AssemblyVersion / FileVersion / NuGet 包版本，并注入源码修订号）；
   - `Directory.Packages.props`：NuGet 中心化包管理（CPM），所有包版本统一维护，csproj 中 `PackageReference` 只写 `Include` 不写 `Version`。
@@ -115,20 +125,22 @@ COMPACTION_KEEP_RECENT_TOKENS=20000
 ### 运行
 
 ```bash
-# 真实模型模式
+# 交互式 TUI（真实模型，默认入口）
 dotnet run
 
-# 自定义提示词
+# TUI + 离线脚本化 LLM（无需 API Key）
+dotnet run -- --mock
+
+# TUI 启动即提交一条提示词
 dotnet run -- --prompt "请按 report-format 技能的模板汇报 12*34*2 的结果"
 
-# 离线 mock 模式（无需 API Key）
-dotnet run -- mock
+# headless 一次性演示（子命令分流）
+dotnet run -- mock        # 离线脚本化演示（错误即观察 + steering）
+dotnet run -- compact     # 离线上下文压缩演示（compaction_start / compaction_end 事件）
+dotnet run -- skills      # 离线技能管理演示
 
-# 离线上下文压缩演示（无需 API Key，观察 compaction_start / compaction_end 事件）
-dotnet run -- compact
-
-# 离线技能管理演示（无需 API Key）
-dotnet run -- skills
+# 通用参数：--new 强制新建会话、--tree 打印会话条目树、--no-skills 禁用技能
+dotnet run -- mock --new --tree
 ```
 
 运行后会执行示例任务："先计算 12×34，再把结果乘以 2"，可以在控制台看到完整的推理-工具调用-观察过程，以及最终的 transcript 摘要。
@@ -152,6 +164,9 @@ dotnet run -- skills
 | `FormatForPrompt()` | `<available_skills>` XML 摘要注入 | `formatSkillsForPrompt` |
 | `ExpandCommand()` | `/skill:name args` 展开为 user 消息 | `_expandSkillCommand` |
 | `Directory.Build.props` / `Directory.Packages.props` | 版本与包集中管理 | —（工程实践） |
+| `TuiApp` | REPL + slash 命令 + 事件渲染 | `InteractiveMode` / `@earendil-works/pi-tui` |
+| `/new` `/resume` `/compact` `/skill:` | TUI 内命令分发 | `BUILTIN_SLASH_COMMANDS` |
+| `Program.cs`（System.CommandLine） | 命令路由：默认 TUI + 子命令 | `main.ts` CLI 解析 |
 
 ## License
 

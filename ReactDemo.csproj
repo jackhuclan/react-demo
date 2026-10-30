@@ -16,6 +16,8 @@
     <!-- 版本号统一由 Directory.Packages.props 集中管理 -->
     <PackageReference Include="DotNetEnv" />
     <PackageReference Include="OpenAI" />
+    <PackageReference Include="Spectre.Console" />
+    <PackageReference Include="System.CommandLine" />
   </ItemGroup>
 
 </Project>

@@ -310,3 +310,79 @@ When a skill file references a relative path, resolve it against the skill direc
 ### 状态
 
 ✅ 已完成
+
+---
+
+## R7：交互式 TUI + System.CommandLine 命令路由（2026-10-30）
+
+### 背景
+
+R6 之后所有能力（会话/压缩/记忆/技能）只有 headless 一次性演示入口，缺少 pi 的核心使用形态：**交互式终端（TUI）**。同时入口需要结构化命令路由，把各演示分支（mock/compact/skills）从 `if(args.Contains(...))` 升级为 System.CommandLine 子命令，TUI 成为默认入口。
+
+### 调研结论（D:/repo/front/pi，核心在 packages/tui + modes/interactive）
+
+**技术栈**：pi **没有用任何第三方 TUI 框架**——自研 `@earendil-works/pi-tui`（约 13k 行，唯一运行时依赖是 marked），底层直接操作 ANSI：组件树 + 每帧 `render(width)=>string[]` + **行级差分渲染**（只重画变化行）；双渲染器（主屏 scrollback / 备用屏受约束布局）；CSI 2026 同步输出防闪烁；光标用零宽 APC 标记定位（IME 服务）。
+
+**应用层中枢**：`interactive-mode.ts` 单文件 6904 行，职责 = 组件树组装 + 事件映射 + slash 命令分发 + 退出流程。
+
+**完整数据流**：
+```
+stdin(raw mode) → Editor（多行编辑：换行/提交/历史/粘贴占位符）
+  → onSubmit（3096 行）："/xxx" → 命令处理器；"!cmd" → bash；
+    streaming 中 → prompt(text, steer)；否则 → 主循环 session.prompt()
+  → AgentSession 循环 → _emit(event) → handleEvent switch（3297–3685 行）
+  → 操作组件树 → ui.requestRender()（16ms 节流 + 输入抢占）→ 差分写终端
+```
+
+**关键映射（事件 → UI）**：turn_start → spinner；message_start/update → AssistantMessage 组件整段重建（靠 (text,width) 缓存摊平成本）；toolCall 出现 → 独立 ToolExecutionComponent（pendingTools Map 按 toolCallId 索引，背景色表达 pending/success/error，Ctrl+O 折叠展开）；tool_execution_end → updateResult + 从 pendingTools 删除；agent_end → 清 spinner；queue_update → dock 区渲染 steering/followUp 队列；compaction → 压缩 spinner + 结束后按新 context 重渲。
+
+**slash 命令体系**：`BUILTIN_SLASH_COMMANDS` 清单（settings/model/tree/thinking/export/import/copy/name/session/new/compact/resume/reload/quit...）**只用于自动补全**；实际分发是 onSubmit 里一长串 if。动态命令来源：prompt 模板、extension 注册、`skill:<name>`。自动补全：`/` 开头无空格 → 命令名模糊匹配；`@` → fd 文件补全；下拉列表直接追加在编辑器渲染输出之后。
+
+**编辑器提交语义**（editor.ts）：Enter 提交 / Shift+Enter·Ctrl+J 换行（不支持的终端用 `\`+Enter 兼容）；Up/Down 仅在第一可视行才翻历史（多行冲突的经典解法）；bracketed paste，大粘贴（>10 行或 >1000 字符）插 `[paste #N]` 占位符提交时展开。
+
+**启动/退出**：main.ts 解析 CLI → runtime（extensions/skills/context files）→ SessionManager.create/open/continueRecent → InteractiveMode.run()：init（信号处理、组件挂载、raw mode、资源总览、rebindCurrentSession、renderInitialMessages 回放历史）→ `while(true) getUserInput → session.prompt`；/quit 或空 Ctrl+D → drainInput → ui.stop → 打印 `pi --session <uuid>` 恢复命令；Ctrl+C 两次退出（第一次清空编辑器）。
+
+**复刻优先级**：必须复刻 = 事件→UI 映射、slash 分发、提交语义、footer/spinner；可简化 = 差分渲染器（Spectre 下整屏重绘）；可省略 = overlay 栈、alt-screen 布局引擎、图片协议、kill-ring/undo、extension/widget、session 树 UI。
+
+### 设计方案（C# 复刻，Spectre.Console + System.CommandLine）
+
+- **`Demo/TuiApp.cs`**（交互式 TUI）：
+  - REPL 主循环 = `AnsiConsole.Prompt(TextPrompt "›")` → `HandleInputAsync`（对应 pi 的 run() 主循环 + onSubmit 分发）；检测 `Console.IsInputRedirected` 非交互时提示退出（对应 pi 的 TTY 检测）；
+  - slash 命令：`/help /new /resume /session /tree /skills /compact [说明] /skill:NAME 参数 /exit /quit`（demo 子集；`/skill:` 落到对话路径先 ExpandCommand 再提交，与 pi 的展开时机一致）；`/new`、`/resume` 重建 Agent 并重接会话（对应 pi 的 runtimeHost.newSession / rebindCurrentSession）；
+  - 事件 → UI（内嵌 `TuiEventPrinter`，对齐 pi handleEvent 语义）：assistant 流式游标差量输出、工具调用 `⚒ name(args)` + 结果状态色（绿/红）、压缩事件黄色通知、TurnStart 无边框分隔；
+  - 启动横幅：FigletText + 资源总览表（模式/会话/技能/长期记忆/命令，对应 pi 的 loaded resources 分组展示）；
+  - `BuildAgent()` 统一重建（对应 pi rebind）：system prompt = base + 记忆 + 技能摘要；工具 calculate + read_file；真实模型用环境变量压缩配置。
+- **`Demo/Bootstrap.cs`**（共享启动装配，对应 pi createAgentSessionRuntime）：记忆加载、技能加载（含诊断打印）、BuildSystemPrompt、OpenSession、CreateRealModelAgent/CreateMockAgent、RealModelCompactionSettings、PrintSessionTree（自 Program 迁出）。
+- **`Demo/HeadlessDemo.cs`**：原 headless 流程迁入（mock/compact/skills 三分支复用 Bootstrap），TUI 不再重复。
+- **`Program.cs`**（System.CommandLine 2.0.14 GA）：**默认 root action = TUI**；`mock / compact / skills` 为子命令（各带 `--new/--tree/--no-skills/--prompt`）；`--help` 自动生成、`--version` 自动输出 `1.0.0+<git-sha>`（版本来自 R6 的 Directory.Build.props）。
+- **新依赖**（经 CPM 加入 Directory.Packages.props）：`Spectre.Console 0.57.2`、`System.CommandLine 2.0.14`。
+
+### 实现中修复的问题
+
+1. **C# 名字查找坑**：`ReactDemo.Demo` 内裸写 `Agent` 被解析为**命名空间** `ReactDemo.Agent`（外层命名空间成员优先于编译单元级 using 别名）——别名 `using Agent = ReactDemo.Agent.Agent;` 必须放在 `namespace` 声明**内部**才生效。
+2. System.CommandLine GA API 与 beta 文档差异：`Command.Subcommands`（非 Commands）、`rootCommand.Parse(args).InvokeAsync()`（非 rootCommand.InvokeAsync）、`SetAction(Func<ParseResult, Task<int>>)`。通过包内 XML 文档 dump 确认真实 API 面。
+3. `dotnet add package` 在 CPM 下自动把版本写入 Directory.Packages.props（csproj 保持无版本）。
+
+### 与 pi 的差异（演示规模取舍）
+
+| 项 | pi | 本项目 |
+|----|----|--------|
+| TUI 框架 | 自研 ANSI 组件树 + 行级差分渲染 | Spectre.Console 直接输出（整帧重绘） |
+| 编辑器 | 多行编辑/粘贴占位符/kill-ring/undo | 单行 TextPrompt（终端自带历史） |
+| 自动补全 | 命令 + `@`文件 + 参数级 | 无（/help 展示命令表） |
+| 命令集 | 20+ 内置 + extension 动态 | 9 个核心命令 |
+| 流式中插话 | steer/followUp 队列 + dock 区显示 | 无（REPL 单回合同步） |
+| footer | token 统计/上下文百分比/git 分支 | 资源总览在启动横幅（不驻留） |
+| 退出恢复提示 | `pi --session <uuid>` | 提示下次启动自动继续（ContinueRecent 语义） |
+
+### 验收标准
+
+- `dotnet run -- --help`：显示根命令（TUI 默认）与 mock/compact/skills 子命令。
+- `dotnet run -- --version`：输出 `1.0.0+<git-sha>`。
+- `dotnet run -- mock / compact / skills`：headless 回归全部通过。
+- TUI：真实终端进入交互循环，slash 命令可用；输入重定向时优雅退出。
+- Release 构建 0 错误；CI 绿灯。
+
+### 状态
+
+✅ 已完成

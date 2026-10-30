@@ -1,19 +1,17 @@
 <Project>
-
   <!-- 集中包管理（Central Package Management）：所有 NuGet 包版本统一在此维护，
        各 csproj 中的 PackageReference 只写 Include 不写 Version。
        详见 https://learn.microsoft.com/nuget/consume-packages/central-package-management -->
-
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
     <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
     <!-- 集中管理下不允许 csproj 内再写版本号，避免双源 -->
     <CentralPackageVersionOverrideEnabled>false</CentralPackageVersionOverrideEnabled>
   </PropertyGroup>
-
   <ItemGroup Label="环境与 LLM 接入">
     <PackageVersion Include="DotNetEnv" Version="3.2.0" />
     <PackageVersion Include="OpenAI" Version="2.14.0" />
+    <PackageVersion Include="Spectre.Console" Version="0.57.2" />
+    <PackageVersion Include="System.CommandLine" Version="2.0.14" />
   </ItemGroup>
-
 </Project>
